@@ -1,45 +1,40 @@
-import instaloader
+import os
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-
-
-def _fetch_account(username: str, since: datetime) -> dict:
-    L = instaloader.Instaloader(
-        quiet=True,
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        save_metadata=False,
-        request_timeout=15,
-    )
-    posts = []
-    profile = instaloader.Profile.from_username(L.context, username)
-    for post in profile.get_posts():
-        if post.date_utc < since:
-            break
-        posts.append({
-            "type": "Video" if post.is_video else "Bild/Foto",
-            "date": post.date_local,
-            "url": f"https://www.instagram.com/p/{post.shortcode}/",
-            "caption": (post.caption or "").strip()[:120],
-            "likes": post.likes,
-        })
-    return posts
+from apify_client import ApifyClient
 
 
 def check_new_posts(accounts: list[str]) -> dict:
+    client = ApifyClient(os.environ["APIFY_TOKEN"])
     since = datetime.now(timezone.utc) - timedelta(hours=25)
-    results = {}
+    results = {u: {"posts": [], "error": None} for u in accounts}
 
-    for username in accounts:
-        results[username] = {"posts": [], "error": None}
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_fetch_account, username, since)
-                results[username]["posts"] = future.result(timeout=45)
-        except FuturesTimeout:
-            results[username]["error"] = "Timeout — Instagram antwortet nicht (möglicherweise blockiert)"
-        except Exception as e:
-            results[username]["error"] = str(e)
+    run_input = {
+        "directUrls": [f"https://www.instagram.com/{u}/" for u in accounts],
+        "resultsType": "posts",
+        "resultsLimit": 5,
+    }
+
+    try:
+        run = client.actor("apify/instagram-scraper").call(run_input=run_input)
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            username = item.get("ownerUsername", "")
+            if username not in results:
+                continue
+            timestamp = item.get("timestamp")
+            if not timestamp:
+                continue
+            post_date = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if post_date < since:
+                continue
+            results[username]["posts"].append({
+                "type": "Video" if item.get("type") == "Video" else "Bild/Foto",
+                "date": post_date.astimezone().replace(tzinfo=None),
+                "url": item.get("url", ""),
+                "caption": (item.get("caption") or "").strip()[:120],
+                "likes": item.get("likesCount", 0),
+            })
+    except Exception as e:
+        for u in accounts:
+            results[u]["error"] = str(e)
 
     return results
